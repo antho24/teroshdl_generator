@@ -14,7 +14,9 @@ import pprint
 VHDL_INST_REGEX = re.compile(r":\s*entity\s+(?:([\w\d_]+)\.)?([\w\d_]+)(?:\s*\([\w\d_]+\))?", re.IGNORECASE)
 VHDL_USE_REGEX = re.compile(r"^\s*use\s+(?:([\w\d_]+)\.)?([\w\d_]+)\.all;", re.IGNORECASE | re.MULTILINE)
 VHDL_ENTITY_DEF_REGEX = re.compile(r"^\s*entity\s+([a-zA-Z0-9_]+)\s+is", re.IGNORECASE | re.MULTILINE)
+VHDL_CONFIG_USE_ENTITY_REGEX = re.compile(r"use\s+entity\s+(?:([\w\d_]+)\.)?([\w\d_]+)(?:\s*\([\w\d_]+\))?\s*;", re.IGNORECASE | re.MULTILINE)
 VHDL_PACKAGE_DEF_REGEX = re.compile(r"^\s*package\s+([a-zA-Z0-9_]+)\s+is", re.IGNORECASE | re.MULTILINE)
+VHDL_COMP_DECL_REGEX = re.compile(r"^\s*component\s+([\w\d_]+)\s+is", re.IGNORECASE | re.MULTILINE)
 VERILOG_INST_REGEX = re.compile(r"^\s*([a-zA-Z_]\w*)\s*(?:#\s*\(.*?\))?\s+([a-zA-Z_]\w*)\s*\(", re.MULTILINE)
 VERILOG_INCLUDE_REGEX = re.compile(r'^\s*`include\s*"(.*?)"', re.IGNORECASE | re.MULTILINE)
 VERILOG_MODULE_DEF_REGEX = re.compile(r"^\s*module\s+([a-zA-Z_]\w*)\s*(?:#\s*\(.*?\))?\s*[;\(]", re.IGNORECASE | re.MULTILINE | re.DOTALL)
@@ -138,45 +140,39 @@ def find_dependencies_in_file(file_path, unit_map, default_lib):
 
     # --- VHDL Parsing with Corrected Architecture ---
     if file_path.lower().endswith(('.vhd', '.vhdl')):
-        for regex in (VHDL_USE_REGEX, VHDL_INST_REGEX):
+        for regex, is_component_decl in [
+            (VHDL_USE_REGEX, False), 
+            (VHDL_INST_REGEX, False), 
+            (VHDL_CONFIG_USE_ENTITY_REGEX, False),
+            (VHDL_COMP_DECL_REGEX, True) # New addition
+        ]:
             for match in regex.finditer(content):
-                lib_name, unit_name = match.groups()
-                raw_unit_name = unit_name; unit_name = unit_name.lower()
+                # For component declarations, the library is always implicit.
+                # For others, we parse it from the match.
+                lib_name = None if is_component_decl else match.group(1)
+                unit_name = match.group(1) if is_component_decl else match.group(2)
                 
+                raw_unit_name = unit_name; unit_name = unit_name.lower()
                 path_candidates = []
 
-                # --- PHASE 1: GATHER ALL POSSIBLE CANDIDATES ---
-                
-                # Case A: The instantiation is explicit (e.g., 'ip_lib.my_unit').
-                # This is a hard directive from the user; we only look in that library.
-                if lib_name and lib_name.lower() != 'work':
-                    key = (lib_name.lower(), unit_name)
-                    if key in unit_map:
-                        path_candidates = unit_map[key]
-                
-                # Case B: The instantiation is implicit ('my_unit') or 'work.my_unit'.
-                # This is potentially ambiguous, so we must search ALL libraries.
-                else:
+                # A component declaration or an implicit/work instantiation requires a global search.
+                is_global_search = is_component_decl or not (lib_name and lib_name.lower() != 'work')
+
+                if is_global_search:
                     for (map_lib, map_unit), paths in unit_map.items():
                         if map_unit == unit_name:
                             path_candidates.extend(paths)
-
-                # --- PHASE 2: RESOLVE THE GATHERED CANDIDATES ---
+                else: # Explicit library dependency
+                    key = (lib_name.lower(), unit_name)
+                    if key in unit_map:
+                        path_candidates = unit_map[key]
 
                 if path_candidates:
-                    best_match_path = None
-                    if len(path_candidates) > 1:
-                        print(f"    [!] Ambiguity Note: In {os.path.basename(file_path)}, dependency '{raw_unit_name}' has multiple definitions. Resolving by proximity.")
-                        best_match_path = get_best_path_by_proximity(path_candidates)
-                    else:
-                        best_match_path = path_candidates[0]
-                    
-                    if best_match_path:
-                        dependencies.add(best_match_path)
+                    best_match_path = get_best_path_by_proximity(path_candidates)
+                    if best_match_path: dependencies.add(best_match_path)
                 else:
-                    # If, after all searching, the list is still empty, the dependency is missing.
                     original_dep_str = f"{lib_name}.{raw_unit_name}" if lib_name else raw_unit_name
-                    if lib_name.lower() != 'ieee':
+                    if lib_name and lib_name.lower() != 'ieee' and lib_name.lower() != 'std':
                         print(f"    [!] Warning: In {os.path.basename(file_path)}, dependency '{original_dep_str}' could not be resolved in any library.")
 
     # --- Verilog/SV Parsing ---
@@ -427,12 +423,9 @@ def main():
 
     # The rest of the script works as before, just passing the list of paths
     unit_map, file_to_lib_map = build_design_unit_map(args.search_path, lib_map, args.library)
-    print(f"unit_map = \n{pprint.pformat(unit_map, indent=2)}")
-    print(f"file_to_lib_map = \n{pprint.pformat(file_to_lib_map, indent=2)}")
 
     ordered_files = resolve_dependency_tree(args.toplevel_file, unit_map, file_to_lib_map, args.library)
     
-    print(f"ordered_files = \n{pprint.pformat(ordered_files, indent=2)}")
     if not ordered_files:
         print("[-] Error: Could not resolve any files."); return
     generate_yaml_file(args, ordered_files, file_to_lib_map)
